@@ -1,0 +1,120 @@
+name: Sync Fork
+
+on:
+  schedule:
+    - cron: '0 2 * * *' # Runs daily
+  workflow_dispatch:
+
+env:
+  SOURCE_REMOTE_URL: https://github.com/SasaKaranovic/DIY-Filament-Dryer.git # URL of the source repo to sync from
+  SOURCE_MAIN_BRANCH: master # Branch name of the source repo to sync from (adjust if needed)
+  ADDITIONAL_BRANCH: no # Options: no, yes
+  SOURCE_ADD_BRANCH: docs # only used when ADDITIONAL_BRANCH is set to yes
+  TARGET_ADD_BRANCH: docs # only used when ADDITIONAL_BRANCH is set to yes
+  MERGE_TYPE: hardreset # Options: hardreset, merge, squash, rebase
+  DISABLE_NEW_WORKFLOWS: yes # Options: yes, no
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      
+      - name: Set up GitHub CLI
+        run: |
+          sudo apt update
+          sudo apt install -y curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update
+          sudo apt install gh -y
+          gh auth login --with-token <<< "${{ secrets.GITHUB_TOKEN }}"
+      
+      - name: Generate Token
+        uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: "${{ secrets.BOT_APP_ID }}"
+          private-key: "${{ secrets.BOT_APP_PRIVATE_KEY }}"
+
+      - name: Checkout fork repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          path: fork
+          token: "${{ steps.app-token.outputs.token }}"
+
+      - name: List contents of workflows directory
+        run: |
+          ls -la fork/.github/workflows
+      
+      - name: Save Sync Fork Workflow
+        run: |
+          mkdir -p /tmp
+          cp fork/.github/workflows/sync-fork.yaml /tmp/sync-fork.yaml
+      
+      - name: Add source remote
+        run: |
+          cd fork
+          git remote add source ${{ env.SOURCE_REMOTE_URL }}
+   
+      - name: Set Git Config
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+      - name: Sync source to fork (main)
+        run: |
+          cd fork
+          git fetch source
+          if [ "${{ env.MERGE_TYPE }}" == "hardreset" ]; then
+            git reset --hard source/${{ env.SOURCE_MAIN_BRANCH }}
+          elif [ "${{ env.MERGE_TYPE }}" == "merge" ]; then
+            git merge source/${{ env.SOURCE_MAIN_BRANCH }}
+          elif [ "${{ env.MERGE_TYPE }}" == "squash" ]; then
+            git merge --squash source/${{ env.SOURCE_MAIN_BRANCH }}
+          elif [ "${{ env.MERGE_TYPE }}" == "rebase" ]; then
+            git rebase source/${{ env.SOURCE_MAIN_BRANCH }}
+          fi
+          git push origin ${{ env.SOURCE_MAIN_BRANCH }} --force
+      
+      - name: Sync source to fork (additional branch)
+        if: ${{ env.ADDITIONAL_BRANCH == 'yes' }}
+        run: |
+          cd fork
+          git fetch source
+          if [ "${{ env.MERGE_TYPE }}" == "hardreset" ]; then
+            git reset --hard source/${{ env.SOURCE_ADD_BRANCH }}
+          elif [ "${{ env.MERGE_TYPE }}" == "merge" ]; then
+            git merge source/${{ env.SOURCE_ADD_BRANCH }}
+          elif [ "${{ env.MERGE_TYPE }}" == "squash" ]; then
+            git merge --squash source/${{ env.SOURCE_ADD_BRANCH }}
+          elif [ "${{ env.MERGE_TYPE }}" == "rebase" ]; then
+            git rebase source/${{ env.SOURCE_ADD_BRANCH }}
+          fi
+          git push origin ${{ env.TARGET_ADD_BRANCH }} --force
+      
+      - name: Restore Sync Fork Workflow
+        run: |
+          mkdir -p fork/.github/workflows
+          cp /tmp/sync-fork.yaml fork/.github/workflows/sync-fork.yaml
+          cd fork
+          git add .github/workflows/sync-fork.yaml
+          git commit -m "Restore sync-fork.yaml"
+          git push origin ${{ env.SOURCE_MAIN_BRANCH }}
+      - name: Delete logs of failed workflows
+        if: ${{ env.DISABLE_NEW_WORKFLOWS == 'yes' }}
+        run: |
+          FAILED_RUNS=$(gh api -X GET /repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/actions/runs?status=failure | jq -r '.workflow_runs[].id')
+          for run_id in $FAILED_RUNS; do
+            gh api -X DELETE /repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/actions/runs/$run_id/logs
+          done
+      
+      - name: Disable all workflows except sync-fork.yaml
+        if: ${{ env.DISABLE_NEW_WORKFLOWS == 'yes' }}
+        run: |
+          WORKFLOWS=$(gh api -X GET /repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/actions/workflows | jq -r '.workflows[] | select(.state == "active") | .id')
+          for workflow in $WORKFLOWS; do
+            workflow_name=$(gh api -X GET /repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/actions/workflows/$workflow | jq -r '.path')
+            if [[ "$workflow_name" != ".github/workflows/sync-fork.yaml" ]]; then
+              gh api -X PUT /repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/actions/workflows/$workflow/disable
+            fi
+          done
